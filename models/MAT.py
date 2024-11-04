@@ -2350,7 +2350,7 @@ class SynthesisNet(nn.Module):
 
 
 @persistent_class
-class Generator(nn.Module):
+class MAT(nn.Module):
     def __init__(self,
                  z_dim,                  # Input latent (Z) dimensionality, 0 = no latent.
                  c_dim,                  # Conditioning label (C) dimensionality, 0 = no label.
@@ -2468,7 +2468,7 @@ if __name__ == '__main__':
     device = torch.device('cpu')
     batch = 1
     res = 512
-    G = Generator(z_dim=512, c_dim=0, w_dim=512, img_resolution=512, img_channels=3).to(device)
+    G = MAT(z_dim=512, c_dim=0, w_dim=512, img_resolution=512, img_channels=3).to(device)
     D = Discriminator(c_dim=0, img_resolution=res, img_channels=3).to(device)
     img = torch.randn(batch, 3, res, res).to(device)
     mask = torch.randn(batch, 1, res, res).to(device)
