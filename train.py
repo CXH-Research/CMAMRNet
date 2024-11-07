@@ -39,7 +39,7 @@ def train():
     testloader = DataLoader(dataset=val_dataset, batch_size=1, shuffle=False, num_workers=8, drop_last=False, pin_memory=True)
 
     # Model & Loss
-    model = Model()
+    model = DeepFillV2()
     criterion_psnr = torch.nn.MSELoss()
 
     # Optimizer & Scheduler
@@ -66,7 +66,7 @@ def train():
 
             # forward
             optimizer_b.zero_grad()
-            res = model(inp)
+            res = model(inp, mas)
 
             loss_psnr = criterion_psnr(res, tar)
             loss_ssim = 1 - structural_similarity_index_measure(res, tar, data_range=1)
@@ -91,7 +91,7 @@ def train():
                 tar = data[2]
 
                 with torch.no_grad():
-                    res = model(inp)
+                    res = model(inp, mas)
 
                 res, tar = accelerator.gather((res, tar))
 

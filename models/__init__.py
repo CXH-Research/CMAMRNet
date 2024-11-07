@@ -1,6 +1,6 @@
 from .CoordFill import CoordFill
 from .HFill import HFill
-from .DeepFillv2 import DeepFillv2
+from .DeepFillv2 import DeepFillV2
 from .MISF import MISF
 from .DFNet import DFNet
 from .DWTNet import DWTNet
