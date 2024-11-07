@@ -99,9 +99,9 @@ class FFC_conv_residual_block(nn.Module):
         return x
 
 
-class Lama(nn.Module):
+class LaMa(nn.Module):
     def __init__(self, channels_in=4, channels_out=3, down_steps=3, up_steps=3, base_mult=64, n_ffc_residual=9, global_percent=0.6):
-        super(Lama, self).__init__()
+        super(LaMa, self).__init__()
 
         down = [nn.ReflectionPad2d(3),
                 nn.Conv2d(channels_in, base_mult, kernel_size=7, bias=True), #not good
@@ -141,6 +141,6 @@ class Lama(nn.Module):
 if __name__ == '__main__':
     x = torch.randn(1, 3, 256, 256)
     mask = torch.randn(1, 1, 256, 256)
-    model = Lama()
+    model = LaMa()
     res= model(x, mask)
     print(res.shape)
