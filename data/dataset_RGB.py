@@ -57,11 +57,13 @@ class DataLoaderTrain(Dataset):
 
         mas_img = F.to_tensor(transformed['mask'])
 
+        tar_img = inp_img
+
         inp_img = inp_img * mas_img
 
         filename = os.path.basename(inp_path)
 
-        return inp_img, mas_img, filename
+        return inp_img, mas_img, tar_img, filename
 
 
 class DataLoaderVal(Dataset):
@@ -108,8 +110,9 @@ class DataLoaderVal(Dataset):
         inp_img = F.to_tensor(inp_img)
         mas_img = F.to_tensor(mas_img)
 
+        tar_img = inp_img
         inp_img = inp_img * mas_img
 
         filename = os.path.basename(inp_path)
 
-        return inp_img, mas_img, filename
+        return inp_img, mas_img, tar_img, filename
