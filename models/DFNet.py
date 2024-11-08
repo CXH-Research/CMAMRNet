@@ -265,11 +265,11 @@ class DFNet(nn.Module):
                 alphas.append(alpha)
                 raws.append(raw)
 
-        return results[::-1], alphas[::-1], raws[::-1]
+        return results[::-1][0]
     
 if __name__ == '__main__':
     x = torch.randn(2, 3, 256, 256)
     mask = torch.randn(2, 1, 256, 256)
     model = DFNet()
     res = model(x, mask)
-    print(res[0][0].shape)
+    print(res.shape)
