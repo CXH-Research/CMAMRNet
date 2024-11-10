@@ -8,3 +8,5 @@ from .LaMa import LaMa
 from .HINT import HINT
 from .RN import RN
 from .Tformer import Tformer
+from .CMT import CMT
+from .SyFormer import SyFormer
