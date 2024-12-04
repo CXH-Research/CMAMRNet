@@ -177,13 +177,13 @@ class HFill(nn.Module):
         )
 
     def forward(self, img, mask):
-        img_256 = F.interpolate(img, size=[256, 256], mode='bilinear')
-        mask_256 = F.interpolate(mask, size=[256, 256], mode='nearest')
-        first_masked_img = img_256 * (1 - mask_256) + mask_256
-        first_in = torch.cat((first_masked_img, mask_256),
+        img_half = F.interpolate(img, size=[img.shape[2] // 2, img.shape[3] // 2], mode='bilinear')
+        mask_half = F.interpolate(mask, size=[img.shape[2] // 2, img.shape[3] // 2], mode='nearest')
+        first_masked_img = img_half * (1 - mask_half) + mask_half
+        first_in = torch.cat((first_masked_img, mask_half),
                              1)  # in: [B, 4, H, W]
         first_out = self.coarse(first_in)  # out: [B, 3, H, W]
-        first_out = F.interpolate(first_out, size=[512, 512], mode='bilinear')
+        first_out = F.interpolate(first_out, size=[img.shape[2], img.shape[3]], mode='bilinear')
         # Refinement
         second_in = img * (1 - mask) + first_out * mask
         pl1 = self.refinement1(second_in)  # out: [B, 32, 256, 256]
@@ -195,7 +195,7 @@ class HFill(nn.Module):
         pl3 = self.refinement6(second_out) + \
             second_out  # out: [B, 128, 64, 64]
         # Calculate Attention
-        patch_fb = self.cal_patch(32, mask, 512)
+        patch_fb = self.cal_patch(32, mask, img.shape[2])
         att = self.compute_attention(pl3, patch_fb)
 
         second_out = torch.cat((pl3, self.conv_pl3(
@@ -210,38 +210,55 @@ class HFill(nn.Module):
         second_out = torch.clamp(second_out, 0, 1)
         return second_out
 
-    def cal_patch(self, patch_num, mask, raw_size):
-        pool = nn.MaxPool2d(raw_size // patch_num)  # patch_num=32
-        patch_fb = pool(mask)  # out: [B, 1, 32, 32]
+    def cal_patch(self, patch_num, mask):
+        # Dynamically calculate patch size based on input dimensions
+        pool = nn.AdaptiveMaxPool2d((patch_num, patch_num))
+        patch_fb = pool(mask)
         return patch_fb
 
-    def compute_attention(self, feature, patch_fb):  # in: [B, C:128, 64, 64]
+    def compute_attention(self, feature, patch_fb):
         b = feature.shape[0]
-        # in: [B, C:128, 32, 32]
-        feature = F.interpolate(feature, scale_factor=0.5, mode='bilinear')
+        # Adaptive pooling for feature map
+        feature = F.adaptive_avg_pool2d(feature, (32, 32))
         p_fb = torch.reshape(patch_fb, [b, 32 * 32, 1])
         p_matrix = torch.bmm(p_fb, (1 - p_fb).permute([0, 2, 1]))
-        f = feature.permute([0, 2, 3, 1]).reshape([b, 32 * 32, 128])
+        f = feature.permute([0, 2, 3, 1]).reshape([b, 32 * 32, feature.shape[1]])
         c = self.cosine_Matrix(f, f) * p_matrix
         s = F.softmax(c, dim=2) * p_matrix
         return s
 
-    def attention_transfer(self, feature, attention):  # feature: [B, C, H, W]
+    def attention_transfer(self, feature, attention):
         b_num, c, h, w = feature.shape
-        f = self.extract_image_patches(feature, 32)
-        f = torch.reshape(f, [b_num, f.shape[1] * f.shape[2], -1])
+        
+        # Calculate adaptive patch sizes
+        patch_h = h // 32
+        patch_w = w // 32
+        
+        # Handle cases where dimensions aren't perfectly divisible by 32
+        if patch_h == 0:
+            patch_h = 1
+        if patch_w == 0:
+            patch_w = 1
+            
+        f = self.extract_image_patches(feature, (patch_h, patch_w))
+        f = torch.reshape(f, [b_num, 32 * 32, -1])
         f = torch.bmm(attention, f)
-        f = torch.reshape(f, [b_num, 32, 32, h // 32, w // 32, c])
+        
+        # Reshape back considering the actual dimensions
+        f = torch.reshape(f, [b_num, 32, 32, patch_h, patch_w, c])
         f = f.permute([0, 5, 1, 3, 2, 4])
         f = torch.reshape(f, [b_num, c, h, w])
         return f
 
-    def extract_image_patches(self, img, patch_num):
-        b, c, h, w = img.shape
-        img = torch.reshape(
-            img, [b, c, patch_num, h//patch_num, patch_num, w//patch_num])
-        img = img.permute([0, 2, 4, 3, 5, 1])
-        return img
+    def extract_image_patches(self, img, patch_size):
+        b, _, _, _ = img.shape
+        ph, pw = patch_size
+        
+        # Use unfold for patch extraction
+        patches = img.unfold(2, ph, ph).unfold(3, pw, pw)
+        patches = patches.permute(0, 2, 3, 1, 4, 5)
+        patches = patches.reshape(b, 32, 32, -1)
+        return patches
 
     def cosine_Matrix(self, _matrixA, _matrixB):
         _matrixA_matrixB = torch.bmm(_matrixA, _matrixB.permute([0, 2, 1]))
@@ -531,8 +548,9 @@ class SpectralNorm(nn.Module):
 
 
 if __name__ == '__main__':
-    model = HFill()
-    img = torch.randn(1, 3, 512, 512)
-    mask = torch.randn(1, 1, 512, 512)
+    model = HFill().cuda()
+    h, w = 256, 256
+    img = torch.randn(1, 3, h, w).cuda()
+    mask = torch.randn(1, 1, h, w).cuda()
     out = model(img, mask)
     print(out.shape)
