@@ -912,6 +912,7 @@ class Model(nn.Module):
                  out_channels=3,
                  dim=48,
                  num_blocks=[4, 6, 6, 8],
+                 num_refinement_blocks=4,
                  heads=[1, 2, 4, 8],
                  ffn_expansion_factor=2.66,
                  bias=False,
@@ -963,7 +964,13 @@ class Model(nn.Module):
             TransformerBlock(dim=int(dim * 2 ** 1), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor,
                              bias=bias, LayerNorm_type=LayerNorm_type) for _ in range(num_blocks[0])])
 
-
+        self.refinement = nn.Sequential(*[
+            TransformerBlock(dim=int(dim * 2 ** 1), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor,
+                             bias=bias, LayerNorm_type=LayerNorm_type) for _ in range(num_refinement_blocks)])
+        
+        self.refinement = nn.Sequential(*[
+            MaxAggBlock(int(dim * 2 ** 1),) for _ in range(num_refinement_blocks)])
+        
         self.output = nn.Sequential(nn.Conv2d(int(dim * 2 ** 1), out_channels, kernel_size=3, stride=1, padding=1, bias=bias))        
 
 
@@ -1002,6 +1009,8 @@ class Model(nn.Module):
         inp_dec_level1 = torch.cat([inp_dec_level1, out_enc_level1], 1)
 
         out_dec_level1 = self.decoder_level1(inp_dec_level1)
+
+        out_dec_level1 = self.refinement(out_dec_level1)
         
         out_dec_level1 = self.output(out_dec_level1)
 
@@ -1013,7 +1022,7 @@ if __name__ == '__main__':
     model = Model().cuda()
     model.eval()
     with torch.no_grad():
-        inp_img = torch.randn(1, 3, 512, 512).cuda()
-        mask_whole = torch.randn(1, 1, 512, 512).cuda()
+        inp_img = torch.randn(1, 3, 256, 256).cuda()
+        mask_whole = torch.randn(1, 1, 256, 256).cuda()
         out = model(inp_img, mask_whole)
         print(out.shape)
