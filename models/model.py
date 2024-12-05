@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numbers
+from einops import rearrange
 from typing import Type, Callable, Tuple
 from timm.layers import SqueezeExcite, SeparableConvNormAct, drop_path, trunc_normal_, Mlp, DropPath, to_2tuple
 
@@ -67,7 +69,7 @@ class MBConv(nn.Module):
             act_layer = _gelu_ignore_parameters
         # Make main path
         self.main_path = nn.Sequential(
-            LayerNorm2d(in_channels),
+            LayerNorm(in_channels, 'WithBias'),
             nn.Conv2d(in_channels=in_channels,
                       out_channels=in_channels, kernel_size=(1, 1)),
             SeparableConvNormAct(in_channels=in_channels, out_channels=out_channels, stride=2 if downscale else 1,
@@ -500,7 +502,7 @@ class FourierUnit(nn.Module):
         self.groups = groups
         self.conv_layer = torch.nn.Conv2d(in_channels=in_channels * 2, out_channels=out_channels * 2,
                                           kernel_size=1, stride=1, padding=0, groups=self.groups, bias=False)
-        self.ln = LayerNorm2d(out_channels * 2) 
+        self.ln = LayerNorm(out_channels * 2, 'WithBias') 
         self.gelu = torch.nn.GELU()
 
     def forward(self, x):
@@ -587,9 +589,9 @@ class Aggregation(nn.Module):
         return out
 
 
-class HBlock(nn.Module):
+class MaxAggBlock(nn.Module):
     def __init__(self, channels=3):
-        super(HBlock, self).__init__()
+        super(MaxAggBlock, self).__init__()
         self.block1 = MaxViTBlock(in_channels=channels, out_channels=channels)
         self.block2 = MaxViTBlock(in_channels=channels, out_channels=channels)
 
@@ -609,332 +611,409 @@ class HBlock(nn.Module):
         return output + x
 
 
-class LayerNormFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, weight, bias, eps):
-        ctx.eps = eps
-        N, C, H, W = x.size()
-        mu = x.mean(1, keepdim=True)
-        var = (x - mu).pow(2).mean(1, keepdim=True)
-        y = (x - mu) / (var + eps).sqrt()
-        ctx.save_for_backward(y, var, weight)
-        y = weight.view(1, C, 1, 1) * y + bias.view(1, C, 1, 1)
-        return y
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        eps = ctx.eps
-
-        N, C, H, W = grad_output.size()
-        y, var, weight = ctx.saved_variables
-        g = grad_output * weight.view(1, C, 1, 1)
-        mean_g = g.mean(dim=1, keepdim=True)
-
-        mean_gy = (g * y).mean(dim=1, keepdim=True)
-        gx = 1. / torch.sqrt(var + eps) * (g - y * mean_gy - mean_g)
-        return gx, (grad_output * y).sum(dim=3).sum(dim=2).sum(dim=0), grad_output.sum(dim=3).sum(dim=2).sum(
-            dim=0), None
+def to_3d(x):
+    return rearrange(x, 'b c h w -> b (h w) c')
 
 
-class LayerNorm2d(nn.Module):
-    def __init__(self, channels, eps=1e-6):
-        super(LayerNorm2d, self).__init__()
-        self.register_parameter('weight', nn.Parameter(torch.ones(channels)))
-        self.register_parameter('bias', nn.Parameter(torch.zeros(channels)))
-        self.eps = eps
+def to_4d(x, h, w):
+    return rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
+
+
+class BiasFree_LayerNorm(nn.Module):
+    def __init__(self, normalized_shape):
+        super(BiasFree_LayerNorm, self).__init__()
+        if isinstance(normalized_shape, numbers.Integral):
+            normalized_shape = (normalized_shape,)
+        normalized_shape = torch.Size(normalized_shape)
+
+        assert len(normalized_shape) == 1
+
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.normalized_shape = normalized_shape
 
     def forward(self, x):
-        return LayerNormFunction.apply(x, self.weight, self.bias, self.eps)
+        sigma = x.var(-1, keepdim=True, unbiased=False)
+        return x / torch.sqrt(sigma + 1e-5) * self.weight
 
 
-# Multi-axis Partial Queried Learning Block (MPQLB)
-class MPQLB(nn.Module):
-    def __init__(self, dim, x=8, y=8, bias=False):
-        super(MPQLB, self).__init__()
+class WithBias_LayerNorm(nn.Module):
+    def __init__(self, normalized_shape):
+        super(WithBias_LayerNorm, self).__init__()
+        if isinstance(normalized_shape, numbers.Integral):
+            normalized_shape = (normalized_shape,)
+        normalized_shape = torch.Size(normalized_shape)
 
-        partial_dim = int(dim // 4)
+        assert len(normalized_shape) == 1
 
-        self.hw = nn.Parameter(torch.ones(1, partial_dim, x, y), requires_grad=True)
-        self.conv_hw = nn.Conv2d(partial_dim, partial_dim, kernel_size=to_2tuple(3), padding=1, groups=partial_dim, bias=bias)
-
-        self.ch = nn.Parameter(torch.ones(1, 1, partial_dim, x), requires_grad=True)
-        self.conv_ch = nn.Conv1d(partial_dim, partial_dim, kernel_size=3, padding=1, groups=partial_dim, bias=bias)
-
-        self.cw = nn.Parameter(torch.ones(1, 1, partial_dim, y), requires_grad=True)
-        self.conv_cw = nn.Conv1d(partial_dim, partial_dim, kernel_size=3, padding=1, groups=partial_dim, bias=bias)
-
-        self.conv_4 = nn.Conv2d(partial_dim, partial_dim, kernel_size=to_2tuple(1), bias=bias)
-
-        self.norm1 = LayerNorm2d(dim)
-        self.norm2 = LayerNorm2d(dim)
-
-        self.mlp = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=to_2tuple(3), padding=1, groups=dim, bias=bias),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(dim, dim, kernel_size=to_2tuple(1), bias=bias),
-        )
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.normalized_shape = normalized_shape
 
     def forward(self, x):
-        input_ = x
-        x = self.norm1(x)
-        x1, x2, x3, x4 = torch.chunk(x, 4, dim=1)
-        # hw
-        x1 = x1 * self.conv_hw(F.interpolate(self.hw, size=x1.shape[2:4], mode='bilinear', align_corners=True))
-        # ch
-        x2 = x2.permute(0, 3, 1, 2)
-        x2 = x2 * self.conv_ch(
-            F.interpolate(self.ch, size=x2.shape[2:4], mode='bilinear', align_corners=True).squeeze(0)).unsqueeze(0)
-        x2 = x2.permute(0, 2, 3, 1)
-        # cw
-        x3 = x3.permute(0, 2, 1, 3)
-        x3 = x3 * self.conv_cw(
-            F.interpolate(self.cw, size=x3.shape[2:4], mode='bilinear', align_corners=True).squeeze(0)).unsqueeze(0)
-        x3 = x3.permute(0, 2, 1, 3)
+        mu = x.mean(-1, keepdim=True)
+        sigma = x.var(-1, keepdim=True, unbiased=False)
+        return (x - mu) / torch.sqrt(sigma + 1e-5) * self.weight + self.bias
 
-        x4 = self.conv_4(x4)
 
-        x = torch.cat([x1, x2, x3, x4], dim=1)
-        x = self.norm2(x)
-        x = self.mlp(x) + input_
+class LayerNorm(nn.Module):
+    def __init__(self, dim, LayerNorm_type):
+        super(LayerNorm, self).__init__()
+        if LayerNorm_type == 'BiasFree':
+            self.body = BiasFree_LayerNorm(dim)
+        else:
+            self.body = WithBias_LayerNorm(dim)
 
+    def forward(self, x):
+        h, w = x.shape[-2:]
+        return to_4d(self.body(to_3d(x)), h, w)
+
+
+##########################################################################
+## Gated-Dconv Feed-Forward Network (GDFN)
+class FeedForward(nn.Module):
+    def __init__(self, dim, ffn_expansion_factor, bias):
+        super(FeedForward, self).__init__()
+
+        hidden_features = int(dim * ffn_expansion_factor)
+
+        self.project_in = nn.Conv2d(dim, hidden_features * 2, kernel_size=1, bias=bias)
+
+        self.dwconv = nn.Conv2d(hidden_features * 2, hidden_features * 2, kernel_size=3, stride=1, padding=1,
+                                groups=hidden_features * 2, bias=bias)
+
+        self.project_out = nn.Conv2d(hidden_features, dim, kernel_size=1, bias=bias)
+
+    def forward(self, x):
+        x = self.project_in(x)
+        x1, x2 = self.dwconv(x).chunk(2, dim=1)
+        x = F.gelu(x1) * x2
+        x = self.project_out(x)
         return x
 
 
-class BasicLayer(nn.Module):
-    def __init__(self, dim, depth):
-        super(BasicLayer, self).__init__()
-        self.blocks = nn.ModuleList([MPQLB(dim, dim) for _ in range(depth)])
+##########################################################################
+## Multi-DConv Head Transposed Self-Attention (MDTA)
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads, bias):
+        super(Attention, self).__init__()
+        self.num_heads = num_heads
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
 
-    def forward(self, x):
-        for blk in self.blocks:
-            x = blk(x)
-        return x
-
-
-class Downsample(nn.Module):
-    def __init__(self, n_feat, bias=False):
-        super(Downsample, self).__init__()
-        self.body = nn.Sequential(
-            nn.Conv2d(n_feat, n_feat // 2, kernel_size=to_2tuple(3), padding=1, bias=bias),
-            nn.PixelUnshuffle(2))
-
-    def forward(self, x):
-        return self.body(x)
-
-
-class Upsample(nn.Module):
-    def __init__(self, n_feat, bias=False):
-        super(Upsample, self).__init__()
-        self.body = nn.Sequential(
-            nn.Conv2d(n_feat, n_feat * 2, kernel_size=to_2tuple(3), padding=1, bias=bias),
-            nn.PixelShuffle(2))
-
-    def forward(self, x):
-        return self.body(x)
-
-
-# Supervised Cross-scale Transposed Attention Module (SCTAM)
-class SCTAM(nn.Module):
-    def __init__(self, dim, up_scale=2, bias=False):
-        super(SCTAM, self).__init__()
-        self.alpha = nn.Parameter(torch.ones(1), requires_grad=True)
-
-        self.up = nn.PixelShuffle(up_scale)
-
-        self.qk_pre = nn.Conv2d(int(dim // (up_scale ** 2)), 3, kernel_size=to_2tuple(1), bias=bias)
-        self.qk_post = nn.Sequential(LayerNorm2d(3),
-                                     nn.Conv2d(3, int(dim * 2), kernel_size=to_2tuple(1), bias=bias))
-
-        self.v = nn.Sequential(
-            LayerNorm2d(dim),
-            nn.Conv2d(dim, dim, kernel_size=to_2tuple(1), bias=bias)
-        )
-
-        self.conv = nn.Conv2d(dim, dim, kernel_size=to_2tuple(3), padding=1, groups=dim, bias=bias)
-
-        self.norm =LayerNorm2d(dim)
-        self.proj = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=to_2tuple(3), padding=1, groups=dim, bias=bias),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(dim, dim, kernel_size=to_2tuple(1), bias=bias)
-        )
+        self.qkv = nn.Conv2d(dim, dim * 3, kernel_size=1, bias=bias)
+        self.qkv_dwconv = nn.Conv2d(dim * 3, dim * 3, kernel_size=3, stride=1, padding=1, groups=dim * 3, bias=bias)
+        self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
 
     def forward(self, x):
         b, c, h, w = x.shape
 
-        qk = self.qk_pre(self.up(x))
-        fake_image = qk
-        qk = self.qk_post(qk).reshape(b, 2, c, -1).transpose(0, 1)
-        q, k = qk[0], qk[1]
+        qkv = self.qkv_dwconv(self.qkv(x))
+        q, k, v = qkv.chunk(3, dim=1)
 
-        q = F.normalize(q, dim=-1)
-        k = F.normalize(k, dim=-1)
+        q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
 
-        v = self.v(x)
-        v_ = v.reshape(b, c, h*w)
+        q = torch.nn.functional.normalize(q, dim=-1)
+        k = torch.nn.functional.normalize(k, dim=-1)
 
-        attn = (q @ k.transpose(-1, -2)) * self.alpha
+        attn = (q @ k.transpose(-2, -1)) * self.temperature
         attn = attn.softmax(dim=-1)
-        x = (attn @ v_).reshape(b, c, h, w) + self.conv(v)
 
-        x = self.norm(x)
-        x = self.proj(x)
+        out = (attn @ v)
 
-        return x, fake_image
+        out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
 
-
-class PIFM(nn.Module):
-    def __init__(self, channel, reduction=8, bias=False):
-        super(PIFM, self).__init__()
-
-        hidden_features = int(channel // reduction)
-
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.a = nn.Sequential(
-            nn.Conv2d(channel, hidden_features, kernel_size=to_2tuple(1), bias=bias),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_features, channel * 2, kernel_size=to_2tuple(1), bias=bias),
-            nn.Softmax(dim=1)
-        )
-        self.t = nn.Sequential(
-            nn.Conv2d(channel, channel, kernel_size=to_2tuple(3), padding=1, groups=channel, bias=bias),
-            nn.Conv2d(channel, hidden_features, kernel_size=to_2tuple(1), bias=bias),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_features, channel * 2, kernel_size=to_2tuple(1), bias=bias),
-            nn.Sigmoid()
-        )
-
-    def forward(self, in_feats):
-        B, C, H, W = in_feats[0].shape
-        in_feats = torch.cat(in_feats, dim=1)
-        in_feats_ = in_feats.view(B, 2, C, H, W)
-        x = torch.sum(in_feats_, dim=1)
-
-        a = self.a(self.avg_pool(x))
-        t = self.t(x)
-        j = torch.mul((1 - t), a) + torch.mul(t, in_feats)
-
-        j = j.view(B, 2, C, H, W)
-        j = torch.sum(j, dim=1)
-        return j
+        out = self.project_out(out)
+        return out
 
 
-class LBlock(nn.Module):
-    def __init__(self, in_channel=3, out_channel=4, dim=24, depths=(4, 4, 4, 2, 2)):
-        super(LBlock, self).__init__()
+##########################################################################
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads, ffn_expansion_factor, bias, LayerNorm_type):
+        super(TransformerBlock, self).__init__()
 
-        self.patch_embed = nn.Conv2d(in_channel, dim, kernel_size=to_2tuple(3), padding=1)
-        self.skip1 = BasicLayer(dim, depths[0])
-
-        self.down1 = Downsample(dim)
-        self.skip2 = BasicLayer(int(dim * 2 ** 1), depths[1])
-
-        self.down2 = Downsample(int(dim * 2 ** 1))
-        self.latent = BasicLayer(int(dim * 2 ** 2), depths[2])
-
-        self.up1 = Upsample(int(dim * 2 ** 2))
-        self.sctam1 = SCTAM(int(dim * 2 ** 1), up_scale=2)
-        self.pifm1 = PIFM(int(dim * 2 ** 1))
-        self.layer4 = BasicLayer(int(dim * 2 ** 1), depths[3])
-
-        self.up2 = Upsample(int(dim * 2 ** 1))
-        self.sctam2 = SCTAM(dim, up_scale=1)
-        self.pifm2 = PIFM(dim)
-        self.layer5 = BasicLayer(dim, depths[4])
-
-        self.patch_unembed = nn.Conv2d(dim, out_channel, kernel_size=to_2tuple(3), padding=1, bias=False)
-
-        self.agg = Aggregation(in_channel * 4, in_channel)
-
-
-    def forward_features(self, x):
-
-        x = self.patch_embed(x)
-        skip1 = x
-
-        x = self.down1(x)
-        skip2 = x
-
-        x = self.down2(x)
-        x = self.latent(x)
-        x = self.up1(x)
-        x, fake_image_x4 = self.sctam1(x)
-
-        x = self.pifm1([x, self.skip2(skip2)]) + x
-        x = self.layer4(x)
-        x = self.up2(x)
-        x, fake_image_x2 = self.sctam2(x)
-
-        x = self.pifm2([x, self.skip1(skip1)]) + x
-        x = self.layer5(x)
-        x = self.patch_unembed(x)
-
-        return x, fake_image_x4, fake_image_x2
-
+        self.norm1 = LayerNorm(dim, LayerNorm_type)
+        self.attn = Attention(dim, num_heads, bias)
+        self.norm2 = LayerNorm(dim, LayerNorm_type)
+        self.ffn = FeedForward(dim, ffn_expansion_factor, bias)
 
     def forward(self, x):
-        input_ = x
-        _, _, h, w = input_.shape
-
-        x, fake_image_x4, fake_image_x2 = self.forward_features(x)
-        K, B = torch.split(x, [1, 3], dim=1)
-
-        x = K * input_ - B + input_
-        x = x[:, :, :h, :w]
-
-        x = torch.cat([input_, x, fake_image_x4, fake_image_x2], dim=1)
-
-        x = self.agg(x)
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ffn(self.norm2(x))
 
         return x
         
 
+
+
+
+##########################################################################
+## Gated Embedding layer
+class GatedEmb(nn.Module):
+    def __init__(self, in_c=3, embed_dim=48, bias=False):
+        super(GatedEmb, self).__init__()
+
+        self.gproj1 = nn.Conv2d(in_c, embed_dim*2, kernel_size=3,stride=1,padding=1,bias=bias)
+
+
+    def forward(self, x):
+        #x = self.proj(x)
+        x = self.gproj1(x)
+        x1, x2 = x.chunk(2, dim=1)
+
+        x = F.gelu(x1) * x2
+
+        return x
+
+
+# class Downsample(nn.Module):
+#     def __init__(self, n_feat):
+#         super(Downsample, self).__init__()
+
+#         self.body = nn.Sequential(nn.Conv2d(n_feat, n_feat // 2, kernel_size=3, stride=1, padding=1, bias=False),
+#                                   nn.PixelUnshuffle(2))
+
+#     def forward(self, x, mask):
+#         return self.body(x)
+
+
+
+# class Upsample(nn.Module):
+#     def __init__(self, n_feat):
+#         super(Upsample, self).__init__()
+
+#         self.body = nn.Sequential(nn.Conv2d(n_feat, n_feat * 2, kernel_size=3, stride=1, padding=1, bias=False),
+#                                   nn.PixelShuffle(2))
+	
+#     def forward(self, x, mask):
+#         return self.body(x)
+
+
+class Downsample(nn.Module):
+    def __init__(self, n_feat):
+        super(Downsample, self).__init__()
+
+        self.body = SamplingBlock(n_feat, n_feat * 2, 0.5)
+
+        self.body2 = nn.Sequential(nn.PixelUnshuffle(2))
+                
+        self.proj = nn.Conv2d(n_feat * 4, n_feat * 2, kernel_size=3, stride=1, padding=1, groups=n_feat * 2, bias=False)
+
+    def forward(self, x, mask):
+        out = self.body(x)
+        out_mask = self.body2(mask)
+        b, n, h, w = out.shape
+        
+        # Create output tensor
+        t = torch.zeros((b, 2 * n, h, w), device=x.device)
+        
+        # Even indices (2*i)
+        t[:, ::2] = out
+        
+        # Odd indices (2*i+1)
+        mask_indices = torch.arange(n) % 4
+        t[:, 1::2] = out_mask[:, mask_indices]
+
+        return self.proj(t)
+
+
+def channel_shuffle(x, groups):
+    batchsize, num_channels, height, width = x.data.size()
+    channels_per_group = num_channels // groups
+    # reshape
+    x = x.view(batchsize, groups,
+               channels_per_group, height, width)
+    x = torch.transpose(x, 1, 2).contiguous()
+    # flatten
+    x = x.view(batchsize, -1, height, width)
+    return x
+
+
+class SamplingBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, scale, kernel_size=3, stride=1):
+        super(SamplingBlock, self).__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.sampling = nn.Sequential(
+            nn.Upsample(scale_factor=scale),
+            nn.Conv2d(self.in_channels, self.in_channels, kernel_size=kernel_size, stride=stride,
+                      padding=kernel_size // 2, groups=self.in_channels, bias=False),
+            LayerNorm(self.in_channels, 'WithBias'),
+            nn.GELU()
+        )
+        self.pwc = nn.Sequential(
+            nn.Conv2d(self.in_channels, self.out_channels, kernel_size=1, stride=1, padding=0, bias=True)
+        )
+
+    def forward(self, x):
+        x = self.sampling(x)
+        x = channel_shuffle(x, self.in_channels)
+        x = self.pwc(x)
+        return x
+    
+
+# class Upsample(nn.Module):
+#     def __init__(self, n_feat):
+#         super(Upsample, self).__init__()
+
+#         self.body = SamplingBlock(n_feat, n_feat, 2)
+
+#         self.body2 = nn.Sequential(nn.PixelShuffle(2))
+                
+#         self.proj = nn.Conv2d(n_feat // 2, n_feat // 2, kernel_size=3, stride=1, 
+#                              padding=1, groups=n_feat//2, bias=False)
+
+#     def forward(self, x, mask):
+#         out = self.body(x)
+#         out_mask = self.body2(mask)
+
+#         b, n, h, w = out.shape
+        
+#         # Create output tensor
+#         t = torch.zeros((b, n//2, h, w), device=x.device)
+        
+#         # Even indices
+#         t = out[:, ::2]
+        
+#         # Combine with mask
+#         mask_indices = torch.arange(n//2) % 4
+#         t = t + out_mask[:, mask_indices]
+
+#         return self.proj(t)    
+
+class Upsample(nn.Module):
+    def __init__(self, n_feat):
+        super(Upsample, self).__init__()
+
+        self.body = SamplingBlock(n_feat, n_feat, 2)
+        
+        self.body2 = nn.Sequential(nn.Conv2d(1, n_feat*2, kernel_size=3, stride=1, padding=1, bias=False), nn.PixelShuffle(2))
+                
+        self.proj = nn.Conv2d(n_feat // 2, n_feat // 2, kernel_size=3, stride=1, 
+                             padding=1, groups=n_feat//2, bias=False)
+
+    def forward(self, x, mask):
+        out = self.body(x)
+        # Process mask
+        mask = self.body2(mask)
+        
+        # Take even indices from out
+        t = out[:, ::2]  # This will have n_feat//2 channels
+        
+        # Now both t and out_mask have n_feat//2 channels
+        t = t + mask
+
+        return self.proj(t)
+    
 class Model(nn.Module):
-    def __init__(self, depth=2):
+    def __init__(self,
+                 inp_channels=4,
+                 out_channels=3,
+                 dim=48,
+                 num_blocks=[4, 6, 6, 8],
+                 heads=[1, 2, 4, 8],
+                 ffn_expansion_factor=2.66,
+                 bias=False,
+                 LayerNorm_type='WithBias',  ## Other option 'BiasFree'
+                 ):
+
         super(Model, self).__init__()
-        self.depth = depth
-        self.LowFrequency = LBlock()
-        self.HighFrequency = nn.ModuleList([HBlock() for _ in range(self.depth)])
 
-    def laplacian_pyramid_decomposition(self, img):
-        current = img
-        pyramid = []
-        for i in range(self.depth):
-            blurred = F.interpolate(current, scale_factor=0.5, mode='bicubic', align_corners=True)
-            expanded = F.interpolate(blurred, current.shape[2:], mode='bicubic', align_corners=True)
-            residual = current - expanded
-            pyramid.append(residual)
-            current = blurred
-        pyramid.append(current)
-        return pyramid
+        self.patch_embed = GatedEmb(inp_channels, dim)
 
-    def laplacian_pyramid_reconstruction(self, pyramid):
-        current = pyramid[-1]
-        for i in reversed(range(self.depth)):
-            expanded = F.interpolate(current, pyramid[i].shape[2:], mode='bicubic', align_corners=True)
-            current = expanded + pyramid[i]
-            current = self.HighFrequency[i](current)
-        return current
+        self.encoder_level1 = nn.Sequential(*[
+            TransformerBlock(dim=dim, num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias,
+                             LayerNorm_type=LayerNorm_type) for _ in range(num_blocks[0])])
 
-    def forward(self, inp):
-        inps = self.laplacian_pyramid_decomposition(inp)
-        inps[-1] = self.LowFrequency(inps[-1])
-        res = self.laplacian_pyramid_reconstruction(inps)
-        return res
+        self.down1_2 = Downsample(dim)  ## From Level 1 to Level 2
+        self.encoder_level2 = nn.Sequential(*[
+            TransformerBlock(dim=int(dim * 2 ** 1), num_heads=heads[1], ffn_expansion_factor=ffn_expansion_factor,
+                             bias=bias, LayerNorm_type=LayerNorm_type) for _ in range(num_blocks[1])])
+
+        self.down2_3 = Downsample(int(dim * 2 ** 1))  ## From Level 2 to Level 3
+        self.encoder_level3 = nn.Sequential(*[
+            TransformerBlock(dim=int(dim * 2 ** 2), num_heads=heads[2], ffn_expansion_factor=ffn_expansion_factor,
+                             bias=bias, LayerNorm_type=LayerNorm_type) for _ in range(num_blocks[2])])
+
+        self.down3_4 = Downsample(int(dim * 2 ** 2))  ## From Level 3 to Level 4
+
+        # self.latent = nn.Sequential(*[
+        #     TransformerBlock(dim=int(dim * 2 ** 3), num_heads=heads[3], ffn_expansion_factor=ffn_expansion_factor,
+        #                      bias=bias, LayerNorm_type=LayerNorm_type) for _ in range(num_blocks[3])])
+
+        self.latent = nn.Sequential(*[
+            MaxAggBlock(int(dim * 2 ** 3)) for _ in range(num_blocks[3])])
+
+        self.up4_3 = Upsample(int(dim * 2 ** 3))  ## From Level 4 to Level 3
+        self.reduce_chan_level3 = nn.Conv2d(int(dim * 2 ** 3), int(dim * 2 ** 2), kernel_size=1, bias=bias)
+        self.decoder_level3 = nn.Sequential(*[
+            TransformerBlock(dim=int(dim * 2 ** 2), num_heads=heads[2], ffn_expansion_factor=ffn_expansion_factor,
+                             bias=bias, LayerNorm_type=LayerNorm_type) for _ in range(num_blocks[2])])
+
+        self.up3_2 = Upsample(int(dim * 2 ** 2))  ## From Level 3 to Level 2
+        self.reduce_chan_level2 = nn.Conv2d(int(dim * 2 ** 2), int(dim * 2 ** 1), kernel_size=1, bias=bias)
+        self.decoder_level2 = nn.Sequential(*[
+            TransformerBlock(dim=int(dim * 2 ** 1), num_heads=heads[1], ffn_expansion_factor=ffn_expansion_factor,
+                             bias=bias, LayerNorm_type=LayerNorm_type) for _ in range(num_blocks[1])])
+
+        self.up2_1 = Upsample(int(dim * 2 ** 1))  ## From Level 2 to Level 1  (NO 1x1 conv to reduce channels)
+
+        self.decoder_level1 = nn.Sequential(*[
+            TransformerBlock(dim=int(dim * 2 ** 1), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor,
+                             bias=bias, LayerNorm_type=LayerNorm_type) for _ in range(num_blocks[0])])
 
 
-# Sample usage with a random image
+        self.output = nn.Sequential(nn.Conv2d(int(dim * 2 ** 1), out_channels, kernel_size=3, stride=1, padding=1, bias=bias))        
+
+
+    def forward(self, inp, mask):
+        mask_half = F.interpolate(mask, scale_factor=0.5, mode='nearest')
+        mask_quarter = F.interpolate(mask, scale_factor=0.25, mode='nearest')
+        mask_bottom = F.interpolate(mask, scale_factor=0.125, mode='nearest')
+        
+        inp_enc_level1 = self.patch_embed(torch.cat((inp,mask),dim=1))
+
+        out_enc_level1 = self.encoder_level1(inp_enc_level1)
+
+        inp_enc_level2 = self.down1_2(out_enc_level1, mask)
+        out_enc_level2 = self.encoder_level2(inp_enc_level2)
+
+        inp_enc_level3 = self.down2_3(out_enc_level2, mask_half)
+        out_enc_level3 = self.encoder_level3(inp_enc_level3)
+
+        inp_enc_level4 = self.down3_4(out_enc_level3, mask_quarter)
+
+        latent = self.latent(inp_enc_level4)
+
+        inp_dec_level3 = self.up4_3(latent, mask_bottom)
+        inp_dec_level3 = torch.cat([inp_dec_level3, out_enc_level3], 1)
+
+        inp_dec_level3 = self.reduce_chan_level3(inp_dec_level3)
+        out_dec_level3 = self.decoder_level3(inp_dec_level3)
+
+        inp_dec_level2 = self.up3_2(out_dec_level3, mask_quarter)
+        inp_dec_level2 = torch.cat([inp_dec_level2, out_enc_level2], 1)
+
+        inp_dec_level2 = self.reduce_chan_level2(inp_dec_level2)
+        out_dec_level2 = self.decoder_level2(inp_dec_level2)
+
+        inp_dec_level1 = self.up2_1(out_dec_level2, mask_half)
+        inp_dec_level1 = torch.cat([inp_dec_level1, out_enc_level1], 1)
+
+        out_dec_level1 = self.decoder_level1(inp_dec_level1)
+        
+        out_dec_level1 = self.output(out_dec_level1)
+
+        out_dec_level1 = (torch.tanh(out_dec_level1) + 1) / 2
+        return out_dec_level1
+    
+
 if __name__ == '__main__':
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    img = torch.randn(1, 3, 256, 256).to(device)
-
-    mask = torch.randn(1, 1, 256, 256).to(device)
-
-    levels = 3
-
-    lp_model = Model(levels).to(device)
-
-    reconstructed_img = lp_model(img)
-
-    print(reconstructed_img.shape)
+    model = Model().cuda()
+    model.eval()
+    with torch.no_grad():
+        inp_img = torch.randn(1, 3, 512, 512).cuda()
+        mask_whole = torch.randn(1, 1, 512, 512).cuda()
+        out = model(inp_img, mask_whole)
+        print(out.shape)
