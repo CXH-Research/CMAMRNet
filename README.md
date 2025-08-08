@@ -10,7 +10,7 @@ CMAMRNet: A Contextual Mask-Aware Network Enhancing Mural Restoration Through Co
 
 # 🔮 Dataset
 
-The dataset is available at Kaggle.
+The dataset is available at [Kaggle](https://www.kaggle.com/datasets/xuhangc/dunhuang-grottoes-painting-dataset-and-benchmark).
 
 # ⚙️ Usage
 
@@ -41,7 +41,7 @@ python test.py
 
 # 💗 Acknowledgement
 
-This work was supported in part by the Science and Technology Development Fund, Macau SAR, under Grant 0141/2023/RIA2 and 0193/2023/RIA3, in part by the National Key Research and Development Program of China (No. 2023YFC2506902), the National Natural Science Foundations of China under Grant 62172403, the Distinguished Young Scholars Fund of Guangdong under Grant 2021B1515020019.
+This work was supported in part by the Science and Technology Development Fund, Macau SAR, under  Grant 0141/2023/RIA2 and 0193/2023/RIA3, and the University of Macau under Grant MYRG-GRG2024-00065-FST-UMDF, in part by the Shenzhen Polytechnic University Research Fund (Grant No. 6025310023K).
 
 # 🛎 Citation
 
