@@ -4,7 +4,7 @@ CMAMRNet: A Contextual Mask-Aware Network Enhancing Mural Restoration Through Co
 
 [Yingtie Lei](https://github.com/yingtie-lei), Fanghai Yi, Yihang Dong, Weihuang Liu, [Xiaofeng Zhang](https://zhangbaijin.github.io), Zimeng Li, [Chi-Man Pun](https://www.cis.um.edu.mo/~cmpun/) and [Xuhang Chen](https://cxh.netlify.app/) 📮 (📮 Corresponding authors)
 
-**University of Macau, Guangdong University of Technology, Shanghai Jiao Tong University, Shenzhen Polytechnic University, Huizhou University**
+**University of Macau, Guangdong University of Technology, University of Chinese Academy of Sciences, Shanghai Jiao Tong University, Shenzhen Polytechnic University, Huizhou University**
 
 2025 British Machine Vision Conference (BMVC 2025)
 
