@@ -39,7 +39,7 @@ def train():
     testloader = DataLoader(dataset=val_dataset, batch_size=1, shuffle=False, num_workers=8, drop_last=False, pin_memory=True)
 
     # Model & Loss
-    model = DeepFillV2()
+    model = CMAMRNet()
     criterion_psnr = torch.nn.MSELoss()
 
     # Optimizer & Scheduler

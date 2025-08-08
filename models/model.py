@@ -62,8 +62,8 @@ class MBConv(nn.Module):
         # Save parameter
         self.drop_path_rate: float = drop_path
         # Check parameters for downscaling
-        if not downscale:
-            assert in_channels == out_channels, "If downscaling is utilized input and output channels must be equal."
+        # if not downscale:
+        #     assert in_channels == out_channels, "If downscaling is utilized input and output channels must be equal."
         # Ignore inplace parameter if GELU is used
         if act_layer == nn.GELU:
             act_layer = _gelu_ignore_parameters
@@ -80,10 +80,9 @@ class MBConv(nn.Module):
         )
         # Make skip path
         self.skip_path = nn.Sequential(
-            nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2)),
             nn.Conv2d(in_channels=in_channels,
                       out_channels=out_channels, kernel_size=(1, 1))
-        ) if downscale else nn.Identity()
+        )
 
     def forward(
             self,
@@ -592,19 +591,19 @@ class Aggregation(nn.Module):
 class MaxAggBlock(nn.Module):
     def __init__(self, channels=3):
         super(MaxAggBlock, self).__init__()
-        self.block1 = MaxViTBlock(in_channels=channels, out_channels=channels)
+        self.block1 = MaxViTBlock(in_channels=channels + 1, out_channels=channels)
         self.block2 = MaxViTBlock(in_channels=channels, out_channels=channels)
 
         self.agg_rgb = Aggregation(in_channels = channels * 3, out_channels=channels)
-        self.agg_mas = Aggregation(in_channels = channels * 3, out_channels=channels)
+        self.agg_mas = Aggregation(in_channels = (channels * 2) + 1, out_channels=channels)
     
 
-    def forward(self, x):
-        out_1 = self.block1(x)
+    def forward(self, x, mask):
+        out_1 = self.block1(torch.cat([x,mask],dim=1))
         out_2 = self.block2(out_1)
         
         agg_rgb = self.agg_rgb(torch.cat([out_1, out_2, x], dim=1))
-        agg_mas = self.agg_mas(torch.cat([out_1, out_2, x], dim=1))
+        agg_mas = self.agg_mas(torch.cat([out_1, out_2, mask], dim=1))
         
         output = agg_rgb.mul(torch.sigmoid(agg_mas))
         
@@ -708,7 +707,6 @@ class Attention(nn.Module):
 
         qkv = self.qkv_dwconv(self.qkv(x))
         q, k, v = qkv.chunk(3, dim=1)
-
         q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
         k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
         v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
@@ -813,7 +811,6 @@ class Downsample(nn.Module):
         # Odd indices (2*i+1)
         mask_indices = torch.arange(n) % 4
         t[:, 1::2] = out_mask[:, mask_indices]
-
         return self.proj(t)
 
 
@@ -894,8 +891,7 @@ class Upsample(nn.Module):
                              padding=1, groups=n_feat//2, bias=False)
 
     def forward(self, x, mask):
-        out = self.body(x)
-        # Process mask
+        out = self.body(x)        # Process mask
         mask = self.body2(mask)
         
         # Take even indices from out
@@ -905,8 +901,13 @@ class Upsample(nn.Module):
         t = t + mask
 
         return self.proj(t)
+class EncoderSequential(nn.Sequential):
+    def forward(self, x, mask):
+        for module in self:
+            x = module(x, mask)
+        return x
     
-class Model(nn.Module):
+class CMAMRNet(nn.Module):
     def __init__(self,
                  inp_channels=4,
                  out_channels=3,
@@ -919,7 +920,7 @@ class Model(nn.Module):
                  LayerNorm_type='WithBias',  ## Other option 'BiasFree'
                  ):
 
-        super(Model, self).__init__()
+        super(CMAMRNet, self).__init__()
 
         self.patch_embed = GatedEmb(inp_channels, dim)
 
@@ -943,7 +944,7 @@ class Model(nn.Module):
         #     TransformerBlock(dim=int(dim * 2 ** 3), num_heads=heads[3], ffn_expansion_factor=ffn_expansion_factor,
         #                      bias=bias, LayerNorm_type=LayerNorm_type) for _ in range(num_blocks[3])])
 
-        self.latent = nn.Sequential(*[
+        self.latent = EncoderSequential(*[
             MaxAggBlock(int(dim * 2 ** 3)) for _ in range(num_blocks[3])])
 
         self.up4_3 = Upsample(int(dim * 2 ** 3))  ## From Level 4 to Level 3
@@ -959,19 +960,19 @@ class Model(nn.Module):
                              bias=bias, LayerNorm_type=LayerNorm_type) for _ in range(num_blocks[1])])
 
         self.up2_1 = Upsample(int(dim * 2 ** 1))  ## From Level 2 to Level 1  (NO 1x1 conv to reduce channels)
-
+        self.reduce_chan_level1 = nn.Conv2d(int(dim * 2 ** 1), int(dim), kernel_size=1, bias=bias)
         self.decoder_level1 = nn.Sequential(*[
-            TransformerBlock(dim=int(dim * 2 ** 1), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor,
+            TransformerBlock(dim=int(dim), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor,
                              bias=bias, LayerNorm_type=LayerNorm_type) for _ in range(num_blocks[0])])
 
-        self.refinement = nn.Sequential(*[
-            TransformerBlock(dim=int(dim * 2 ** 1), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor,
-                             bias=bias, LayerNorm_type=LayerNorm_type) for _ in range(num_refinement_blocks)])
+        # self.refinement = nn.Sequential(*[
+        #     TransformerBlock(dim=int(dim * 2 ** 1), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor,
+        #                      bias=bias, LayerNorm_type=LayerNorm_type) for _ in range(num_refinement_blocks)])
         
-        self.refinement = nn.Sequential(*[
-            MaxAggBlock(int(dim * 2 ** 1),) for _ in range(num_refinement_blocks)])
+        self.refinement = EncoderSequential(*[
+            MaxAggBlock(int(dim)) for _ in range(num_refinement_blocks)])
         
-        self.output = nn.Sequential(nn.Conv2d(int(dim * 2 ** 1), out_channels, kernel_size=3, stride=1, padding=1, bias=bias))        
+        self.output = nn.Sequential(nn.Conv2d(int(dim), out_channels, kernel_size=3, stride=1, padding=1, bias=bias))        
 
 
     def forward(self, inp, mask):
@@ -982,7 +983,6 @@ class Model(nn.Module):
         inp_enc_level1 = self.patch_embed(torch.cat((inp,mask),dim=1))
 
         out_enc_level1 = self.encoder_level1(inp_enc_level1)
-
         inp_enc_level2 = self.down1_2(out_enc_level1, mask)
         out_enc_level2 = self.encoder_level2(inp_enc_level2)
 
@@ -990,39 +990,55 @@ class Model(nn.Module):
         out_enc_level3 = self.encoder_level3(inp_enc_level3)
 
         inp_enc_level4 = self.down3_4(out_enc_level3, mask_quarter)
+        latent = self.latent(inp_enc_level4,mask_bottom)
 
-        latent = self.latent(inp_enc_level4)
 
         inp_dec_level3 = self.up4_3(latent, mask_bottom)
+ 
         inp_dec_level3 = torch.cat([inp_dec_level3, out_enc_level3], 1)
+ 
+        
 
         inp_dec_level3 = self.reduce_chan_level3(inp_dec_level3)
+ 
         out_dec_level3 = self.decoder_level3(inp_dec_level3)
+ 
 
         inp_dec_level2 = self.up3_2(out_dec_level3, mask_quarter)
+
         inp_dec_level2 = torch.cat([inp_dec_level2, out_enc_level2], 1)
 
+
         inp_dec_level2 = self.reduce_chan_level2(inp_dec_level2)
+
         out_dec_level2 = self.decoder_level2(inp_dec_level2)
 
+
         inp_dec_level1 = self.up2_1(out_dec_level2, mask_half)
+
+
         inp_dec_level1 = torch.cat([inp_dec_level1, out_enc_level1], 1)
+        inp_dec_level1 = self.reduce_chan_level1(inp_dec_level1)
+
 
         out_dec_level1 = self.decoder_level1(inp_dec_level1)
 
-        out_dec_level1 = self.refinement(out_dec_level1)
+
+        out_dec_level1 = self.refinement(out_dec_level1,mask)
+
         
         out_dec_level1 = self.output(out_dec_level1)
+
 
         out_dec_level1 = (torch.tanh(out_dec_level1) + 1) / 2
         return out_dec_level1
     
 
 if __name__ == '__main__':
-    model = Model().cuda()
+    model = CMAMRNet().cuda()
     model.eval()
     with torch.no_grad():
         inp_img = torch.randn(1, 3, 256, 256).cuda()
         mask_whole = torch.randn(1, 1, 256, 256).cuda()
         out = model(inp_img, mask_whole)
-        print(out.shape)
+        # print(out.shape)
