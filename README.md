@@ -1,6 +1,6 @@
 # 📋 Mural Restoration
 
-CMAMRNet: A Contextual Mask-Aware Network Enhancing Mural Restoration Through Comprehensive Mask Guidance
+[CMAMRNet: A Contextual Mask-Aware Network Enhancing Mural Restoration Through Comprehensive Mask Guidance](https://arxiv.org/abs/2508.07140)
 
 [Yingtie Lei](https://github.com/yingtie-lei), Fanghai Yi, Yihang Dong, Weihuang Liu, [Xiaofeng Zhang](https://zhangbaijin.github.io), Zimeng Li, [Chi-Man Pun](https://www.cis.um.edu.mo/~cmpun/) and [Xuhang Chen](https://cxh.netlify.app/) 📮 (📮 Corresponding authors)
 
